@@ -69,6 +69,7 @@ export default function App() {
   const [dragPos, setDragPos] = useState({x: 0, y: 0});
   const [wildcardChoice, setWildcardChoice] = useState(null);
   const [hoveredTileIndex, setHoveredTileIndex] = useState(null);
+  const [viewedPlayerName, setViewedPlayerName] = useState('');
   
   const boardRef = useRef(null);
   const roomRef = useRef(null);
@@ -384,6 +385,24 @@ export default function App() {
     return newScores;
   };
 
+  const getNormalizedPlayers = (playersState) => (
+    Array.isArray(playersState) ? playersState : Object.values(playersState || {})
+  );
+
+  const getNextPlayableTurn = (players, currentIndex, tilesState, boardState, workersState, placedTilesState) => {
+    for(let offset = 0; offset < players.length; offset++) {
+      const idx = (currentIndex + offset) % players.length;
+      const pTiles = tilesState[players[idx]] || [];
+      const hasMoves = pTiles.some(t => calcMovesForState(t, boardState, workersState, placedTilesState).length > 0);
+      if(hasMoves) return {hasAnyMoves: true, nextPlayerIndex: idx};
+    }
+    return {hasAnyMoves: false, nextPlayerIndex: null};
+  };
+
+  const getWinnerName = (scoresState) => (
+    Object.keys(scoresState).reduce((a, b) => scoresState[a] > scoresState[b] ? a : b)
+  );
+
   const checkOuthouses = (cells) => cells.some(([c, r]) => OUTHOUSES.some(([oc, or]) => oc === c && or === r));
 
   const getTileImageLayout = (x, y, w, h, rotation) => {
@@ -394,10 +413,11 @@ export default function App() {
   };
 
   const onDragStart = (e, tile) => {
-    if (myPlayerIndex !== gameState.currentPlayer) return;
+    if (myPlayerIndex !== gameState.currentPlayer || gameState.pendingVote || gameState.gameEnded) return;
     e.dataTransfer.effectAllowed = 'move';
     setDragging(tile);
-    const moves = calcMovesForState(tile, gameState.board, gameState.workers, gameState.placedTiles);
+    const placedTilesArray = Array.isArray(gameState.placedTiles) ? gameState.placedTiles : Object.values(gameState.placedTiles || {});
+    const moves = calcMovesForState(tile, gameState.board, gameState.workers, placedTilesArray);
     setValidMoves(moves);
     setDragPos({x: e.clientX, y: e.clientY});
   };
@@ -474,10 +494,11 @@ export default function App() {
   };
 
   const placeTile = async (move, tile) => {
-    const players = gameState.players.map(p => p.name);
+    const players = getNormalizedPlayers(gameState.players).map(p => p.name);
     const nb = gameState.board.map(r => r.map(c => ({...c})));
     move.cells.forEach(([c,r]) => { nb[r][c].covered = true; });
-    const newPlacedTiles = [...gameState.placedTiles, {type: tile.type, cells: move.cells, rotation: move.rot, size: tile.size}];
+    const currentPlacedTiles = Array.isArray(gameState.placedTiles) ? gameState.placedTiles : Object.values(gameState.placedTiles || {});
+    const newPlacedTiles = [...currentPlacedTiles, {type: tile.type, cells: move.cells, rotation: move.rot, size: tile.size}];
     const [lc,lr] = move.cells[move.cells.length-1];
     const nw = {...gameState.workers};
     nw[move.track] = {c:lc, r:lr};
@@ -486,10 +507,7 @@ export default function App() {
     nt[pn] = nt[pn].filter(t => t.id !== tile.id);
 
     const newScores = calculateScores(nb, gameState.secretBuildings, players);
-    const noMoves = players.every(p => {
-      const pTiles = nt[p] || [];
-      return pTiles.length === 0 || pTiles.every(t => calcMovesForState(t, nb, nw, newPlacedTiles).length === 0);
-    });
+    const turnResult = getNextPlayableTurn(players, (gameState.currentPlayer + 1) % players.length, nt, nb, nw, newPlacedTiles);
 
     const updates = {
       board: nb,
@@ -499,12 +517,14 @@ export default function App() {
       scores: newScores
     };
 
-    if(noMoves) {
-      const winnerName = Object.keys(newScores).reduce((a, b) => newScores[a] > newScores[b] ? a : b);
+    if(!turnResult.hasAnyMoves) {
       updates.gameEnded = true;
-      updates.winner = winnerName;
+      updates.winner = getWinnerName(newScores);
+      updates.lastActionMessage = 'No players have any legal moves left. Game over!';
     } else {
-      updates.currentPlayer = (gameState.currentPlayer + 1) % players.length;
+      updates.currentPlayer = turnResult.nextPlayerIndex;
+      const skippedCount = (turnResult.nextPlayerIndex - ((gameState.currentPlayer + 1) % players.length) + players.length) % players.length;
+      updates.lastActionMessage = skippedCount > 0 ? `${players[gameState.currentPlayer]} played. ${skippedCount} player(s) had no legal move and were skipped.` : `${players[gameState.currentPlayer]} played a tile.`;
     }
 
     await update(ref(database, `rooms/${roomId}`), updates);
@@ -566,9 +586,18 @@ export default function App() {
         voteSelections: {}
       });
     } else {
+      const playersList = getNormalizedPlayers(gameState.players).map(p => p.name);
+      const turnResult = getNextPlayableTurn(playersList, (gameState.currentPlayer + 1) % playersList.length, gameState.tiles, gameState.board, gameState.workers, Array.isArray(gameState.placedTiles) ? gameState.placedTiles : Object.values(gameState.placedTiles || {}));
+      const scoresNow = calculateScores(gameState.board, gameState.secretBuildings, playersList);
       await update(ref(database, `rooms/${roomId}`), {
         votingCards: newCards,
-        currentPlayer: (gameState.currentPlayer + 1) % players.length,
+        currentPlayer: turnResult.nextPlayerIndex ?? gameState.currentPlayer,
+        gameEnded: !turnResult.hasAnyMoves,
+        winner: !turnResult.hasAnyMoves ? getWinnerName(scoresNow) : null,
+        scores: scoresNow,
+        lastActionMessage: !turnResult.hasAnyMoves
+          ? 'Vote failed, and no players have any legal moves left. Game over!'
+          : 'Vote failed. Turn passes to the next player with a legal move.',
         pendingVote: null,
         voteSelections: {}
       });
@@ -580,6 +609,16 @@ export default function App() {
     navigator.clipboard.writeText(link);
     alert('Room link copied! Share it with friends to play together.');
   };
+
+  useEffect(() => {
+    if (!gameState?.players || myPlayerIndex === null) return;
+    const playersList = (Array.isArray(gameState.players) ? gameState.players : Object.values(gameState.players || {})).map(p => p.name);
+    const myPlayerName = playersList[myPlayerIndex];
+    if (!myPlayerName) return;
+    if (!viewedPlayerName || !playersList.includes(viewedPlayerName)) {
+      setViewedPlayerName(myPlayerName);
+    }
+  }, [gameState, myPlayerIndex, viewedPlayerName]);
 
   // Lobby view - show until game actually starts
   if (inLobby || !gameState || !gameState.started) {
@@ -726,6 +765,7 @@ export default function App() {
   const players = playersArray.map(p => p.name);
   const currentPlayerName = players[gameState.currentPlayer];
   const myName = playersArray[myPlayerIndex]?.name;
+  const selectedPlayerName = viewedPlayerName || myName;
 
   return (
     <div style={{padding:'15px',background:'#F5DEB3',minHeight:'100vh'}}>
@@ -740,9 +780,16 @@ export default function App() {
               <span style={{fontWeight:'bold'}}>{currentPlayerName}: {gameState.scores[currentPlayerName] ?? 15} points</span>
             </div>
           </div>
+
+          <div style={{display:'flex',flexDirection:'column',gap:'6px'}}>
+            <label style={{fontSize:'12px',fontWeight:'bold'}}>View player hand</label>
+            <select value={selectedPlayerName} onChange={(e) => setViewedPlayerName(e.target.value)} style={{padding:'6px',borderRadius:'6px',border:'1px solid #ccc'}}>
+              {players.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
           
           <div style={{display:'flex',gap:'5px',flexWrap:'wrap',maxWidth:'300px'}}>
-            {gameState.votingCards[currentPlayerName]?.map(card => (
+            {(gameState.votingCards[selectedPlayerName] || []).map(card => (
               <div key={card} style={{width:'40px',height:'55px',border:'1px solid #ccc',borderRadius:'3px',overflow:'hidden'}}>
                 <img src={IMAGES[card]} style={{width:'100%',height:'100%',objectFit:'cover'}} alt={card}/>
               </div>
@@ -815,8 +862,8 @@ export default function App() {
           {/* Secret Building - only show current player's secret */}
           {!gameState.gameEnded && (
             <div style={{background:'white',padding:'10px',borderRadius:'10px'}}>
-              <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>Secret: {gameState.secretBuildings[currentPlayerName]?.replace(/_/g,' ')}</h4>
-              <img src={IMAGES[gameState.secretBuildings[currentPlayerName]]} style={{width:'100%',maxHeight:'100px',objectFit:'contain'}} alt=""/>
+              <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>{selectedPlayerName === myName ? 'Your Secret' : `${selectedPlayerName}'s Secret`}: {gameState.secretBuildings[selectedPlayerName]?.replace(/_/g,' ')}</h4>
+              <img src={IMAGES[gameState.secretBuildings[selectedPlayerName]]} style={{width:'100%',maxHeight:'100px',objectFit:'contain'}} alt=""/>
             </div>
           )}
 
@@ -837,14 +884,14 @@ export default function App() {
           {/* Current Player's Tiles */}
           <div style={{background:'white',padding:'10px',borderRadius:'10px',flex:1,display:'flex',flexDirection:'column',minHeight:0,overflow:'hidden'}}>
             <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>
-              Your Tiles ({(gameState.tiles[currentPlayerName] || []).length})
+              {selectedPlayerName === myName ? 'Your Tiles' : `${selectedPlayerName}'s Tiles`} ({(gameState.tiles[selectedPlayerName] || []).length})
             </h4>
             <div style={{overflowY:'auto',flex:1,paddingRight:'5px'}}>
               <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'8px',alignContent:'start'}}>
-                {(gameState.tiles[currentPlayerName] || []).map(t => (
+                {(gameState.tiles[selectedPlayerName] || []).map(t => (
                   <div 
                     key={t.id} 
-                    draggable={currentPlayerName === myName && myPlayerIndex === gameState.currentPlayer} 
+                    draggable={selectedPlayerName === myName && myPlayerIndex === gameState.currentPlayer && !gameState.pendingVote && !gameState.gameEnded} 
                     onDragStart={(e)=>onDragStart(e,t)} 
                     onDrag={onDrag} 
                     onDragEnd={onDragEnd}
@@ -852,7 +899,7 @@ export default function App() {
                       height:'80px',
                       border:'1px solid #ccc',
                       borderRadius:'4px',
-                      cursor: currentPlayerName === myName && myPlayerIndex === gameState.currentPlayer ? 'grab' : 'default',
+                      cursor: selectedPlayerName === myName && myPlayerIndex === gameState.currentPlayer && !gameState.pendingVote && !gameState.gameEnded ? 'grab' : 'default',
                       padding:'4px',
                       background:'white',
                       opacity: dragging?.id === t.id ? 0 : 1,
@@ -946,10 +993,11 @@ export default function App() {
 
       {/* Game over */}
       {gameState.gameEnded && (
-        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}>
-          <div style={{background:'white',padding:'40px',borderRadius:'15px',textAlign:'center',maxWidth:'400px'}}>
+        <div style={{position:'fixed',right:'20px',bottom:'20px',background:'rgba(255,255,255,0.96)',padding:'24px',borderRadius:'15px',textAlign:'center',maxWidth:'400px',zIndex:1000,boxShadow:'0 8px 25px rgba(0,0,0,0.3)'}}>
+          <div>
             <h1 style={{margin:'0 0 20px 0',color:'#FFD700'}}>Game Over!</h1>
             <h2 style={{margin:'0 0 30px 0'}}>{gameState.winner} Wins!</h2>
+            {gameState.lastActionMessage && <div style={{fontSize:'13px',marginBottom:'14px',color:'#555'}}>{gameState.lastActionMessage}</div>}
             <div style={{marginBottom:'30px'}}>
               {Object.entries(gameState.scores || {}).map(([player, score]) => (
                 <div key={player} style={{fontSize:'18px',margin:'10px 0',fontWeight: player === gameState.winner ? 'bold' : 'normal'}}>
@@ -961,6 +1009,12 @@ export default function App() {
               Play Again
             </button>
           </div>
+        </div>
+      )}
+
+      {!gameState.gameEnded && gameState.lastActionMessage && (
+        <div style={{position:'fixed',left:'20px',bottom:'20px',background:'rgba(255,255,255,0.95)',padding:'10px 14px',borderRadius:'10px',fontSize:'13px',boxShadow:'0 4px 10px rgba(0,0,0,0.2)',zIndex:900}}>
+          {gameState.lastActionMessage}
         </div>
       )}
     </div>
