@@ -69,6 +69,7 @@ export default function App() {
   const [dragPos, setDragPos] = useState({x: 0, y: 0});
   const [wildcardChoice, setWildcardChoice] = useState(null);
   const [hoveredTileIndex, setHoveredTileIndex] = useState(null);
+  const [viewedPlayerName, setViewedPlayerName] = useState('');
   
   const boardRef = useRef(null);
   const roomRef = useRef(null);
@@ -109,7 +110,8 @@ export default function App() {
         
         // Find my player index
         if (data.players) {
-          const myIndex = data.players.findIndex(p => p.id === playerId);
+          const playerList = Array.isArray(data.players) ? data.players : Object.values(data.players || {});
+          const myIndex = playerList.findIndex(p => p.id === playerId);
           if (myIndex !== -1) {
             setMyPlayerIndex(myIndex);
             setInLobby(false);
@@ -233,7 +235,7 @@ export default function App() {
     }
 
     // Initialize game state
-    const players = gameState.players.map(p => p.name);
+    const players = getNormalizedPlayers(gameState.players).map(p => p.name);
     const board = Array(10).fill(0).map(() => Array(15).fill(0).map(() => ({covered: false})));
     const workers = {topsy: {c:0, r:0}, road: {c:14, r:0}, river: {c:0, r:9}, turvy: {c:14, r:9}};
     
@@ -384,6 +386,52 @@ export default function App() {
     return newScores;
   };
 
+  const getNormalizedPlayers = (playersState) => (
+    Array.isArray(playersState) ? playersState : Object.values(playersState || {})
+  );
+
+  const getNextPlayableTurn = (players, currentIndex, tilesState, boardState, workersState, placedTilesState) => {
+    for(let offset = 0; offset < players.length; offset++) {
+      const idx = (currentIndex + offset) % players.length;
+      const pTiles = normalizeTilesForPlayer(tilesState, players[idx]);
+      const hasMoves = pTiles.some(t => calcMovesForState(t, boardState, workersState, placedTilesState).length > 0);
+      if(hasMoves) return {hasAnyMoves: true, nextPlayerIndex: idx};
+    }
+    return {hasAnyMoves: false, nextPlayerIndex: null};
+  };
+
+  const getWinnerName = (scoresState) => (
+    Object.keys(scoresState).reduce((a, b) => scoresState[a] > scoresState[b] ? a : b)
+  );
+
+  const normalizeArray = (value) => (
+    Array.isArray(value)
+      ? value.filter(Boolean)
+      : Object.values(value || {}).filter(Boolean)
+  );
+
+  const normalizeTileCells = (cells) => (
+    normalizeArray(cells)
+      .map((cell) => {
+        if (Array.isArray(cell)) return [cell[0], cell[1]];
+        if (cell && typeof cell === 'object') {
+          const c = cell.c ?? cell[0];
+          const r = cell.r ?? cell[1];
+          return [c, r];
+        }
+        return [undefined, undefined];
+      })
+      .filter(([c, r]) => Number.isInteger(c) && Number.isInteger(r))
+  );
+
+  const normalizeTilesForPlayer = (tilesState, playerName) => (
+    normalizeArray(tilesState?.[playerName])
+  );
+
+  const normalizeVotingCardsForPlayer = (cardsState, playerName) => (
+    normalizeArray(cardsState?.[playerName])
+  );
+
   const checkOuthouses = (cells) => cells.some(([c, r]) => OUTHOUSES.some(([oc, or]) => oc === c && or === r));
 
   const getTileImageLayout = (x, y, w, h, rotation) => {
@@ -394,10 +442,11 @@ export default function App() {
   };
 
   const onDragStart = (e, tile) => {
-    if (myPlayerIndex !== gameState.currentPlayer) return;
+    if (myPlayerIndex !== gameState.currentPlayer || gameState.pendingVote || gameState.gameEnded) return;
     e.dataTransfer.effectAllowed = 'move';
     setDragging(tile);
-    const moves = calcMovesForState(tile, gameState.board, gameState.workers, gameState.placedTiles);
+    const placedTilesArray = normalizeArray(gameState.placedTiles).map(t => ({...t, cells: normalizeTileCells(t?.cells)})).filter(t => t.type && t.size && t.cells.length === t.size);
+    const moves = calcMovesForState(tile, gameState.board, gameState.workers, placedTilesArray);
     setValidMoves(moves);
     setDragPos({x: e.clientX, y: e.clientY});
   };
@@ -474,22 +523,20 @@ export default function App() {
   };
 
   const placeTile = async (move, tile) => {
-    const players = gameState.players.map(p => p.name);
+    const players = getNormalizedPlayers(gameState.players).map(p => p.name);
     const nb = gameState.board.map(r => r.map(c => ({...c})));
     move.cells.forEach(([c,r]) => { nb[r][c].covered = true; });
-    const newPlacedTiles = [...gameState.placedTiles, {type: tile.type, cells: move.cells, rotation: move.rot, size: tile.size}];
+    const currentPlacedTiles = normalizeArray(gameState.placedTiles).map(t => ({...t, cells: normalizeTileCells(t?.cells)})).filter(t => t.type && t.size && t.cells.length === t.size);
+    const newPlacedTiles = [...currentPlacedTiles, {type: tile.type, cells: move.cells, rotation: move.rot, size: tile.size}];
     const [lc,lr] = move.cells[move.cells.length-1];
     const nw = {...gameState.workers};
     nw[move.track] = {c:lc, r:lr};
     const pn = players[gameState.currentPlayer];
     const nt = {...gameState.tiles};
-    nt[pn] = nt[pn].filter(t => t.id !== tile.id);
+    nt[pn] = normalizeTilesForPlayer(nt, pn).filter(t => t?.id && t.id !== tile.id);
 
     const newScores = calculateScores(nb, gameState.secretBuildings, players);
-    const noMoves = players.every(p => {
-      const pTiles = nt[p] || [];
-      return pTiles.length === 0 || pTiles.every(t => calcMovesForState(t, nb, nw, newPlacedTiles).length === 0);
-    });
+    const turnResult = getNextPlayableTurn(players, (gameState.currentPlayer + 1) % players.length, nt, nb, nw, newPlacedTiles);
 
     const updates = {
       board: nb,
@@ -499,12 +546,14 @@ export default function App() {
       scores: newScores
     };
 
-    if(noMoves) {
-      const winnerName = Object.keys(newScores).reduce((a, b) => newScores[a] > newScores[b] ? a : b);
+    if(!turnResult.hasAnyMoves) {
       updates.gameEnded = true;
-      updates.winner = winnerName;
+      updates.winner = getWinnerName(newScores);
+      updates.lastActionMessage = 'No players have any legal moves left. Game over!';
     } else {
-      updates.currentPlayer = (gameState.currentPlayer + 1) % players.length;
+      updates.currentPlayer = turnResult.nextPlayerIndex;
+      const skippedCount = (turnResult.nextPlayerIndex - ((gameState.currentPlayer + 1) % players.length) + players.length) % players.length;
+      updates.lastActionMessage = skippedCount > 0 ? `${players[gameState.currentPlayer]} played. ${skippedCount} player(s) had no legal move and were skipped.` : `${players[gameState.currentPlayer]} played a tile.`;
     }
 
     await update(ref(database, `rooms/${roomId}`), updates);
@@ -538,7 +587,7 @@ export default function App() {
   };
 
   const handleVote = async () => {
-    const players = gameState.players.map(p => p.name);
+    const players = getNormalizedPlayers(gameState.players).map(p => p.name);
     let yesVotes = 0, noVotes = 0;
     const usedCards = [];
     
@@ -566,9 +615,19 @@ export default function App() {
         voteSelections: {}
       });
     } else {
+      const playersList = getNormalizedPlayers(gameState.players).map(p => p.name);
+      const normalizedPlaced = normalizeArray(gameState.placedTiles).map(t => ({...t, cells: normalizeTileCells(t?.cells)})).filter(t => t.type && t.size && t.cells.length === t.size);
+      const turnResult = getNextPlayableTurn(playersList, (gameState.currentPlayer + 1) % playersList.length, gameState.tiles, gameState.board, gameState.workers, normalizedPlaced);
+      const scoresNow = calculateScores(gameState.board, gameState.secretBuildings, playersList);
       await update(ref(database, `rooms/${roomId}`), {
         votingCards: newCards,
-        currentPlayer: (gameState.currentPlayer + 1) % players.length,
+        currentPlayer: turnResult.nextPlayerIndex ?? gameState.currentPlayer,
+        gameEnded: !turnResult.hasAnyMoves,
+        winner: !turnResult.hasAnyMoves ? getWinnerName(scoresNow) : null,
+        scores: scoresNow,
+        lastActionMessage: !turnResult.hasAnyMoves
+          ? 'Vote failed, and no players have any legal moves left. Game over!'
+          : 'Vote failed. Turn passes to the next player with a legal move.',
         pendingVote: null,
         voteSelections: {}
       });
@@ -580,6 +639,16 @@ export default function App() {
     navigator.clipboard.writeText(link);
     alert('Room link copied! Share it with friends to play together.');
   };
+
+  useEffect(() => {
+    if (!gameState?.players || myPlayerIndex === null) return;
+    const playersList = (Array.isArray(gameState.players) ? gameState.players : Object.values(gameState.players || {})).map(p => p.name);
+    const myPlayerName = playersList[myPlayerIndex];
+    if (!myPlayerName) return;
+    if (!viewedPlayerName || !playersList.includes(viewedPlayerName)) {
+      setViewedPlayerName(myPlayerName);
+    }
+  }, [gameState, myPlayerIndex, viewedPlayerName]);
 
   // Lobby view - show until game actually starts
   if (inLobby || !gameState || !gameState.started) {
@@ -726,6 +795,7 @@ export default function App() {
   const players = playersArray.map(p => p.name);
   const currentPlayerName = players[gameState.currentPlayer];
   const myName = playersArray[myPlayerIndex]?.name;
+  const selectedPlayerName = viewedPlayerName || myName;
 
   return (
     <div style={{padding:'15px',background:'#F5DEB3',minHeight:'100vh'}}>
@@ -736,13 +806,20 @@ export default function App() {
             <h2 style={{margin:0}}>Wacky West - Room {roomId}</h2>
             <div style={{display:'flex',gap:'20px',marginTop:'8px',fontSize:'14px'}}>
               <span>Current Turn: {currentPlayerName}</span>
-              <span>Tiles: {(gameState.tiles[currentPlayerName] || []).length}</span>
+              <span>Tiles: {normalizeTilesForPlayer(gameState.tiles, currentPlayerName).length}</span>
               <span style={{fontWeight:'bold'}}>{currentPlayerName}: {gameState.scores[currentPlayerName] ?? 15} points</span>
             </div>
           </div>
+
+          <div style={{display:'flex',flexDirection:'column',gap:'6px'}}>
+            <label style={{fontSize:'12px',fontWeight:'bold'}}>View player hand</label>
+            <select value={selectedPlayerName} onChange={(e) => setViewedPlayerName(e.target.value)} style={{padding:'6px',borderRadius:'6px',border:'1px solid #ccc'}}>
+              {players.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
           
           <div style={{display:'flex',gap:'5px',flexWrap:'wrap',maxWidth:'300px'}}>
-            {gameState.votingCards[currentPlayerName]?.map(card => (
+            {normalizeVotingCardsForPlayer(gameState.votingCards, selectedPlayerName).map(card => (
               <div key={card} style={{width:'40px',height:'55px',border:'1px solid #ccc',borderRadius:'3px',overflow:'hidden'}}>
                 <img src={IMAGES[card]} style={{width:'100%',height:'100%',objectFit:'cover'}} alt={card}/>
               </div>
@@ -762,10 +839,12 @@ export default function App() {
                 return <rect key={`${i}-${j}`} x={V[c]} y={H[r]} width={V[c+1]-V[c]} height={H[r+1]-H[r]} fill={hover?"yellow":"lime"} opacity={hover?0.7:0.5} stroke={hover?"orange":"yellow"} strokeWidth="5"/>;
               }))}
               {gameState.pendingVote && (() => {
-                const minC = Math.min(...gameState.pendingVote.move.cells.map(([c]) => c));
-                const maxC = Math.max(...gameState.pendingVote.move.cells.map(([c]) => c));
-                const minR = Math.min(...gameState.pendingVote.move.cells.map(([_, r]) => r));
-                const maxR = Math.max(...gameState.pendingVote.move.cells.map(([_, r]) => r));
+                const pendingCells = normalizeTileCells(gameState.pendingVote.move.cells);
+                if (!pendingCells.length) return null;
+                const minC = Math.min(...pendingCells.map(([c]) => c));
+                const maxC = Math.max(...pendingCells.map(([c]) => c));
+                const minR = Math.min(...pendingCells.map(([_, r]) => r));
+                const maxR = Math.max(...pendingCells.map(([_, r]) => r));
                 return <rect x={V[minC]} y={H[minR]} width={V[maxC+1]-V[minC]} height={H[maxR+1]-H[minR]} fill="orange" opacity="0.5" stroke="red" strokeWidth="8"/>;
               })()}
               {previewMove && dragging && (() => {
@@ -779,7 +858,9 @@ export default function App() {
                 const imageLayout = getTileImageLayout(x, y, w, h, adjustedRot);
                 return <image x={imageLayout.x} y={imageLayout.y} width={imageLayout.width} height={imageLayout.height} href={IMAGES[dragging.type]} preserveAspectRatio="xMidYMid meet" opacity="0.7" transform={`rotate(${adjustedRot} ${centerX} ${centerY})`}/>;
               })()}
-              {(Array.isArray(gameState.placedTiles) ? gameState.placedTiles : Object.values(gameState.placedTiles || {})).map((tile, idx) => {
+              {normalizeArray(gameState.placedTiles).map((rawTile, idx) => {
+                const tile = {...rawTile, cells: normalizeTileCells(rawTile?.cells)};
+                if (!tile.type || !tile.cells.length) return null;
                 const minC = Math.min(...tile.cells.map(([c]) => c));
                 const maxC = Math.max(...tile.cells.map(([c]) => c));
                 const minR = Math.min(...tile.cells.map(([_, r]) => r));
@@ -805,7 +886,23 @@ export default function App() {
                   />
                 );
               })}
-              {Object.entries(gameState.workers).map(([n,w]) => <image key={n} x={V[w.c]+20} y={H[w.r]+20} width={V[w.c+1]-V[w.c]-40} height={H[w.r+1]-H[w.r]-40} href={IMAGES.worker} preserveAspectRatio="xMidYMid meet"/>)}
+              <defs>
+                <clipPath id="workerTokenClip" clipPathUnits="objectBoundingBox">
+                  <circle cx="0.5" cy="0.5" r="0.5" />
+                </clipPath>
+              </defs>
+              {Object.entries(gameState.workers).map(([n,w]) => (
+                <image
+                  key={n}
+                  x={V[w.c]+20}
+                  y={H[w.r]+20}
+                  width={V[w.c+1]-V[w.c]-40}
+                  height={H[w.r+1]-H[w.r]-40}
+                  href={IMAGES.worker}
+                  preserveAspectRatio="xMidYMid slice"
+                  clipPath="url(#workerTokenClip)"
+                />
+              ))}
             </svg>
           </div>
         </div>
@@ -815,8 +912,8 @@ export default function App() {
           {/* Secret Building - only show current player's secret */}
           {!gameState.gameEnded && (
             <div style={{background:'white',padding:'10px',borderRadius:'10px'}}>
-              <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>Secret: {gameState.secretBuildings[currentPlayerName]?.replace(/_/g,' ')}</h4>
-              <img src={IMAGES[gameState.secretBuildings[currentPlayerName]]} style={{width:'100%',maxHeight:'100px',objectFit:'contain'}} alt=""/>
+              <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>{selectedPlayerName === myName ? 'Your Secret' : `${selectedPlayerName}'s Secret`}: {gameState.secretBuildings[selectedPlayerName]?.replace(/_/g,' ')}</h4>
+              <img src={IMAGES[gameState.secretBuildings[selectedPlayerName]]} style={{width:'100%',maxHeight:'100px',objectFit:'contain'}} alt=""/>
             </div>
           )}
 
@@ -837,14 +934,14 @@ export default function App() {
           {/* Current Player's Tiles */}
           <div style={{background:'white',padding:'10px',borderRadius:'10px',flex:1,display:'flex',flexDirection:'column',minHeight:0,overflow:'hidden'}}>
             <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>
-              Your Tiles ({(gameState.tiles[currentPlayerName] || []).length})
+              {selectedPlayerName === myName ? 'Your Tiles' : `${selectedPlayerName}'s Tiles`} ({normalizeTilesForPlayer(gameState.tiles, selectedPlayerName).length})
             </h4>
             <div style={{overflowY:'auto',flex:1,paddingRight:'5px'}}>
               <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'8px',alignContent:'start'}}>
-                {(gameState.tiles[currentPlayerName] || []).map(t => (
+                {normalizeTilesForPlayer(gameState.tiles, selectedPlayerName).map(t => (
                   <div 
                     key={t.id} 
-                    draggable={currentPlayerName === myName && myPlayerIndex === gameState.currentPlayer} 
+                    draggable={selectedPlayerName === myName && myPlayerIndex === gameState.currentPlayer && !gameState.pendingVote && !gameState.gameEnded} 
                     onDragStart={(e)=>onDragStart(e,t)} 
                     onDrag={onDrag} 
                     onDragEnd={onDragEnd}
@@ -852,7 +949,7 @@ export default function App() {
                       height:'80px',
                       border:'1px solid #ccc',
                       borderRadius:'4px',
-                      cursor: currentPlayerName === myName && myPlayerIndex === gameState.currentPlayer ? 'grab' : 'default',
+                      cursor: selectedPlayerName === myName && myPlayerIndex === gameState.currentPlayer && !gameState.pendingVote && !gameState.gameEnded ? 'grab' : 'default',
                       padding:'4px',
                       background:'white',
                       opacity: dragging?.id === t.id ? 0 : 1,
@@ -946,10 +1043,11 @@ export default function App() {
 
       {/* Game over */}
       {gameState.gameEnded && (
-        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}>
-          <div style={{background:'white',padding:'40px',borderRadius:'15px',textAlign:'center',maxWidth:'400px'}}>
+        <div style={{position:'fixed',right:'20px',bottom:'20px',background:'rgba(255,255,255,0.96)',padding:'24px',borderRadius:'15px',textAlign:'center',maxWidth:'400px',zIndex:1000,boxShadow:'0 8px 25px rgba(0,0,0,0.3)'}}>
+          <div>
             <h1 style={{margin:'0 0 20px 0',color:'#FFD700'}}>Game Over!</h1>
             <h2 style={{margin:'0 0 30px 0'}}>{gameState.winner} Wins!</h2>
+            {gameState.lastActionMessage && <div style={{fontSize:'13px',marginBottom:'14px',color:'#555'}}>{gameState.lastActionMessage}</div>}
             <div style={{marginBottom:'30px'}}>
               {Object.entries(gameState.scores || {}).map(([player, score]) => (
                 <div key={player} style={{fontSize:'18px',margin:'10px 0',fontWeight: player === gameState.winner ? 'bold' : 'normal'}}>
@@ -961,6 +1059,12 @@ export default function App() {
               Play Again
             </button>
           </div>
+        </div>
+      )}
+
+      {!gameState.gameEnded && gameState.lastActionMessage && (
+        <div style={{position:'fixed',left:'20px',bottom:'20px',background:'rgba(255,255,255,0.95)',padding:'10px 14px',borderRadius:'10px',fontSize:'13px',boxShadow:'0 4px 10px rgba(0,0,0,0.2)',zIndex:900}}>
+          {gameState.lastActionMessage}
         </div>
       )}
     </div>
